@@ -1,0 +1,32 @@
+# Core utilities
+numpy
+pandas
+pillow
+tqdm
+matplotlib
+scikit-learn
+opencv-python-headless
+
+# Deep learning stack (for CLIP training)
+torch==2.7.1+cu126
+torchvision==0.22.1+cu126
+torchaudio==2.7.1+cu126
+xformers==0.0.27.post2
+
+# Hugging Face + tokenization
+transformers
+accelerate
+datasets
+tokenizers
+sentencepiece
+huggingface-hub
+safetensors
+ftfy
+regex
+
+# Logging, serving, misc.
+fastapi==0.103.2
+uvicorn==0.23.2
+requests
+coloredlogs
+pyyaml
