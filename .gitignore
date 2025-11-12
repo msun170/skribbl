@@ -1,0 +1,32 @@
+# datasets (do NOT push images)
+quickdraw_png256/
+sketchy_png256/
+quickdraw_ndjson/
+sketchy/               # any source trees
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# training artifacts
+checkpoints/
+runs/
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# temp + logs
+tmp/
+*.log
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# large CSVs if you want to keep repo small (optional—keep if needed)
+# training_manifest.csv
+# sketchy_manifest.csv
+# quickdraw_manifest.csv

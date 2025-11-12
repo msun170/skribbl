@@ -1,0 +1,10 @@
+{
+  "alcohol": ["wine_bottle"],
+  "vodka": ["wine_bottle"],
+  "wine": ["wine_bottle", "wine_glass"],
+  "hot air balloon": ["hot-air_balloon"],
+  "teddy bear": ["teddy_bear"],
+  "sea turtle": ["sea_turtle"],
+  "sedan": ["car_(sedan)"],
+  "mercedes": ["car_(sedan)"]
+}
