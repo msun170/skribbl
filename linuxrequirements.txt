@@ -1,4 +1,4 @@
-# Core utilities
+# Core utils
 numpy
 pandas
 pillow
@@ -7,13 +7,12 @@ matplotlib
 scikit-learn
 opencv-python-headless
 
-# Deep learning stack (for CLIP training)
-torch==2.7.1+cu126
-torchvision==0.22.1+cu126
-torchaudio==2.7.1+cu126
-xformers==0.0.27.post2
+# Deep learning stack (Torch 2.7.1 family; install from cu126 index)
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 
-# Hugging Face + tokenization
+# HF + tokenization
 transformers
 accelerate
 datasets
@@ -24,7 +23,7 @@ safetensors
 ftfy
 regex
 
-# Logging, serving, misc.
+# Optional API
 fastapi==0.103.2
 uvicorn==0.23.2
 requests
