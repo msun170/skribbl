@@ -1,69 +1,125 @@
-# test_dataloader.py
-import argparse, json, os, random
-import pandas as pd
+#!/usr/bin/env python3
+import argparse
+from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
-from dataset_csv.py import SketchCSV  # adjust import if needed
+from torch.utils.data import DataLoader, Subset
+
+# Import your dataset (CSVClipDataset) and keep back-compat alias if you used it
+from dataset_csv import CSVClipDataset as SketchCSV
+
+def _unpack_batch(batch):
+    """
+    Supports either:
+      - dict batches: {'images', 'labels', 'texts', 'paths'} or similar keys
+      - tuple/list batches: (images, labels, texts, paths) or (images, labels, texts)
+    Returns: (images, labels, texts, paths or None)
+    """
+    images = labels = texts = paths = None
+
+    if isinstance(batch, dict):
+        images = batch.get('images') or batch.get('image')
+        labels = batch.get('labels') or batch.get('label')
+        texts  = batch.get('texts')  or batch.get('text')
+        paths  = batch.get('paths')  or batch.get('path')
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) >= 2:
+            images, labels = batch[0], batch[1]
+        if len(batch) >= 3:
+            texts = batch[2]
+        if len(batch) >= 4:
+            paths = batch[3]
+    return images, labels, texts, paths
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True)
-    ap.add_argument("--class_index", required=True)
-    ap.add_argument("--prompts", required=True)
-    ap.add_argument("--data_root", default=".")
-    ap.add_argument("--image_size", type=int, default=224)
-    ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--num_workers", type=int, default=0)
-    ap.add_argument("--limit", type=int, default=128)
-    ap.add_argument("--batches", type=int, default=2)
-    ap.add_argument("--shuffle_first", action="store_true")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser(description="Smoke-test CSV dataset + DataLoader.")
+    p.add_argument("--manifest", required=True, help="Path to manifest CSV (linux_training_manifest*.csv)")
+    p.add_argument("--splits", default=None, help="Path to splits.csv (optional but supported)")
+    p.add_argument("--class_index", default=None, help="class_index.json (optional)")
+    p.add_argument("--prompts", default=None, help="prompts.json (optional)")
+    p.add_argument("--split", default="train", choices=["train", "val", "test"], help="Which split to use")
+    p.add_argument("--image_size", type=int, default=224)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--limit", type=int, default=0, help="Limit dataset to N samples (0 = no limit)")
+    p.add_argument("--batches", type=int, default=2, help="How many batches to print")
+    p.add_argument("--shuffle", action="store_true", help="Shuffle batches")
+    args = p.parse_args()
 
-    df = pd.read_csv(args.manifest)
-    if args.shuffle_first:
-        df = df.sample(frac=1, random_state=7)
-    if args.limit > 0:
-        df = df.head(args.limit)
-    df.to_csv("_tmp_subset_manifest.csv", index=False)
+    manifest_path = Path(args.manifest)
+    assert manifest_path.exists(), f"Manifest not found: {manifest_path}"
 
-    with open(args.class_index, "r") as f:
-        class_index = json.load(f)
-    with open(args.prompts, "r") as f:
-        prompts = json.load(f)
+    if args.splits:
+        assert Path(args.splits).exists(), f"Splits CSV not found: {args.splits}"
+    if args.class_index:
+        assert Path(args.class_index).exists(), f"class_index.json not found: {args.class_index}"
+    if args.prompts:
+        assert Path(args.prompts).exists(), f"prompts.json not found: {args.prompts}"
 
+    # Build dataset
     ds = SketchCSV(
-        manifest_csv="_tmp_subset_manifest.csv",
-        class_index=class_index,
-        prompts=prompts,
-        image_size=args.image_size,
-        data_root=args.data_root,
-        augment=False,   # set True if you wired augs
+        manifest_csv=str(manifest_path),
+        splits_csv=args.splits,
+        class_index_json=args.class_index,
+        prompts_json=args.prompts,
+        split=args.split,
+        img_size=args.image_size,
+        # prompt_strategy = "random"  # uncomment if you expose this in your dataset class
     )
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
-    print(f"Dataset size (tested subset): {len(ds)}  |  classes: {len(class_index)}")
-    for i, batch in enumerate(dl):
-        imgs = batch["image"]          # [B,3,H,W]
-        labels = batch["label"]        # [B]
-        texts = batch["text"]          # list[str]
-        paths = batch["path"]
-        names = batch["label_str"]
+    print(f"Dataset size (total for split='{args.split}'): {len(ds)}")
 
-        print(f"\nBatch {i+1}:")
-        print("  images: ", imgs.shape, " (dtype=", imgs.dtype, ")")
-        print("  labels: ", labels.shape, " min=", labels.min().item(), " max=", labels.max().item())
-        print("  texts[0]:", texts[0])
-        print("  label_str[0]:", names[0])
-        print("  path[0]:", paths[0])
+    # Limit if requested
+    if args.limit and args.limit > 0:
+        ds = Subset(ds, range(min(args.limit, len(ds))))
+        print(f"Dataset size (limited): {len(ds)}")
 
-        if i+1 >= args.batches:
+    # DataLoader
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=args.shuffle,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        drop_last=False,
+    )
+
+    # Iterate a few batches
+    for bi, batch in enumerate(loader):
+        if bi >= args.batches:
             break
+        images, labels, texts, paths = _unpack_batch(batch)
 
-    # class counts
-    counts = pd.Series([x for x in df['label']]).value_counts().head(10)
-    print("\n— Subset label counts (top 10) —")
-    for k, v in counts.items():
-        print(f"  {k:25s} {v}")
+        # Print shapes / dtypes
+        if isinstance(images, torch.Tensor):
+            print(f"\nBatch {bi+1}:")
+            print(f"  images:  {tuple(images.shape)}  (dtype={images.dtype})")
+        else:
+            print(f"\nBatch {bi+1}: images is not a tensor (type={type(images)})")
+
+        if isinstance(labels, torch.Tensor):
+            print(f"  labels:  {tuple(labels.shape)}  min={labels.min().item()} max={labels.max().item()}")
+        else:
+            try:
+                print(f"  labels:  len={len(labels)}  type={type(labels)}")
+            except Exception:
+                print(f"  labels:  type={type(labels)}")
+
+        # Show a sample text/path if present
+        sample_text = None
+        sample_path = None
+        try:
+            if texts is not None:
+                sample_text = texts[0] if isinstance(texts, (list, tuple)) else texts
+            if paths is not None:
+                sample_path = paths[0] if isinstance(paths, (list, tuple)) else paths
+        except Exception:
+            pass
+
+        if sample_text is not None:
+            print(f"  texts[0]: {repr(sample_text)[:120]}")
+        if sample_path is not None:
+            print(f"  path[0]:  {sample_path}")
 
 if __name__ == "__main__":
     main()
