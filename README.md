@@ -1,7 +1,7 @@
 ﻿# skribbl
 
 to run test_dataloader.py:
-///
+
 python test_dataloader.py \
   --manifest training_manifest.csv \
   --class_index class_index.json \
@@ -11,10 +11,10 @@ python test_dataloader.py \
   --image_size 224 \
   --limit 1024 \
   --shuffle_first  # if you added this flag
-///
+
 
 training:
-///
+
 python train_clip.py \
   --manifest training_manifest.csv \
   --class_index class_index.json \
@@ -30,10 +30,10 @@ python train_clip.py \
   --precision amp \
   --workers 8 \
   --out_dir checkpoints
-///
+
 
 eval:
-///
+
 python eval_clip.py \
   --manifest training_manifest.csv \
   --class_index class_index.json \
@@ -46,4 +46,5 @@ python eval_clip.py \
   --checkpoint checkpoints/last.ckpt \
   --save_csv eval_results.csv \
   --letter_filter  # enables the letter-aware evaluation
-///
+
+
