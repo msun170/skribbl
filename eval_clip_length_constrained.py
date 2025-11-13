@@ -1,396 +1,243 @@
 #!/usr/bin/env python3
-"""
-eval_clip_length_constrained.py
-
-Evaluates a CLIP model on your manifest/splits with TWO protocols:
-  1) Standard: rank over all classes (Top-1 / Top-5)
-  2) Length-constrained: rank only among classes whose canonical label has
-     the same character count (letters-only, no spaces/punct) as the GT label
-     (Top-1 / Top-5). This simulates the game's "word length" hint.
-
-Assumptions:
-- You have: training_manifest.csv, splits.csv, class_index.json, prompts.json
-- You can run on CPU (no GPU required) for pipeline sanity checks.
-- Works with either open_clip or HuggingFace CLIP (auto-detected via --backend).
-
-Example:
-  python eval_clip_length_constrained.py \
-      --manifest training_manifest.csv \
-      --splits splits.csv \
-      --class_index class_index.json \
-      --prompts prompts.json \
-      --split test \
-      --backend open_clip \
-      --model ViT-B-32 \
-      --pretrained laion2b_s34b_b79k \
-      --batch_size 64 \
-      --device cpu
-"""
+# eval_clip_length_constrained.py
 
 import argparse
-import csv
 import json
-import math
-import os
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import torch
-import torchvision.transforms as T
-from PIL import Image
-import pandas as pd
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import open_clip
 
-# -------------------------------
-# Utilities
-# -------------------------------
+from dataset_csv import CSVClipDataset
+
+
 def norm_label_for_length(s: str) -> str:
-    """Normalize for letter-count: remove spaces/punct, lowercase."""
     s = s.lower()
-    s = re.sub(r"[^a-z]", "", s)  # keep letters a-z only
+    s = re.sub(r"[^a-z]", "", s)
     return s
+
 
 def letter_len(s: str) -> int:
     return len(norm_label_for_length(s))
 
-def load_json(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def average_l2_normalized(embs: torch.Tensor) -> torch.Tensor:
-    # embs: [N, D]
-    embs = torch.nn.functional.normalize(embs, dim=-1)
-    avg = embs.mean(dim=0, keepdim=True)
-    return torch.nn.functional.normalize(avg, dim=-1)  # [1, D]
-
-# -------------------------------
-# CLIP backends
-# -------------------------------
-def build_openclip(model_name: str, pretrained: str, device: str):
-    import open_clip
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, device=device
-    )
-    tokenizer = open_clip.get_tokenizer(model_name)
-
-    # Ensure image transform matches your pngs (preprocess is fine; add center-crop safety)
-    # Note: open_clip preprocess already includes Resize/CenterCrop/ToTensor/Normalize
-    return model, tokenizer, preprocess
-
-def build_hfclip(model_name_or_path: str, device: str):
-    from transformers import CLIPModel, CLIPProcessor
-    model = CLIPModel.from_pretrained(model_name_or_path)
-    processor = CLIPProcessor.from_pretrained(model_name_or_path)
-    model.to(device)
-
-    # For HF we’ll wrap minimal API for parity
-    def tokenize(texts: List[str]) -> Dict[str, torch.Tensor]:
-        tok = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
-        return {k: v for k, v in tok.items() if k in ("input_ids", "attention_mask")}
-
-    # simple image transform that matches processor; we’ll use processor for images anyway
-    def preprocess_pil(pil: Image.Image) -> Dict[str, torch.Tensor]:
-        pix = processor(images=pil, return_tensors="pt")
-        return pix
-
-    return model, tokenize, preprocess_pil, processor
-
-# -------------------------------
-# Data helpers
-# -------------------------------
-class ManifestDataset(torch.utils.data.Dataset):
-    def __init__(self, manifest_csv: str, split_csv: str, which_split: str,
-                 class_index: Dict[str, int], img_transform):
-        self.df = pd.read_csv(manifest_csv)
-        splits = pd.read_csv(split_csv)
-
-        # Expect columns: path,label in manifest; id or path join key in splits
-        # We’ll join on path, which is unique in your pipeline.
-        if "path" not in self.df.columns or "label" not in self.df.columns:
-            raise ValueError("manifest must contain columns: path,label,...")
-
-        if "path" not in splits.columns or "split" not in splits.columns:
-            raise ValueError("splits must contain columns: path,split,...")
-
-        merged = self.df.merge(splits[["path", "split"]], on="path", how="inner")
-        merged = merged[merged["split"].str.lower() == which_split.lower()].copy()
-
-        # Keep only rows whose label is in class_index
-        merged = merged[merged["label"].isin(class_index.keys())].reset_index(drop=True)
-
-        self.df = merged
-        self.class_index = class_index
-        self.img_transform = img_transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        r = self.df.iloc[idx]
-        path = r["path"]
-        label = r["label"]
-        try:
-            img = Image.open(path).convert("RGB")
-        except Exception:
-            # fallback: try without leading "./"
-            p = path[2:] if path.startswith("./") else path
-            img = Image.open(p).convert("RGB")
-        if callable(self.img_transform):
-            img = self.img_transform(img)
-        y = self.class_index[label]
-        return img, label, path, y
-
-# -------------------------------
-# Build class text embeddings
-# -------------------------------
-def build_class_text_embeds_openclip(model, tokenizer, prompts_json, label_list, device):
-    texts = []
-    idx_of_class = []  # map back
-    for cls in label_list:
-        variants = prompts_json.get(cls, [f"a drawing of a {cls}", f"a sketch of a {cls}"])
-        # tokenize all variants
-        tok = tokenizer(variants)
-        with torch.no_grad():
-            # open_clip: model.encode_text expects tokenized ints
-            txt = model.encode_text(tok.to(device))
-        cls_embed = average_l2_normalized(txt)  # [1, D]
-        texts.append(cls_embed)
-        idx_of_class.append(cls)
-    return torch.cat(texts, dim=0), idx_of_class  # [C, D], list of class names
-
-def build_class_text_embeds_hf(model, processor, prompts_json, label_list, device):
-    embs = []
-    idx_of_class = []
-    for cls in label_list:
-        variants = prompts_json.get(cls, [f"a drawing of a {cls}", f"a sketch of a {cls}"])
-        # Encode each variant and average
-        var_embs = []
-        for v in variants:
-            with torch.no_grad():
-                tok = processor(text=[v], return_tensors="pt", padding=True, truncation=True).to(device)
-                txt = model.get_text_features(**tok)  # [1, D]
-                txt = torch.nn.functional.normalize(txt, dim=-1)
-            var_embs.append(txt)
-        cls_embed = torch.stack(var_embs, dim=0).mean(dim=0)
-        cls_embed = torch.nn.functional.normalize(cls_embed, dim=-1)
-        embs.append(cls_embed)
-        idx_of_class.append(cls)
-    return torch.cat(embs, dim=0), idx_of_class
-
-# -------------------------------
-# Evaluation
-# -------------------------------
-@torch.no_grad()
-def eval_loop(
-    model,
-    dataloader,
-    device,
-    class_names: List[str],
-    class_embeds: torch.Tensor,  # [C, D] normalized
-    backend: str,
-    hf_processor=None
-):
+def collate_eval(batch):
     """
-    Returns:
-      metrics dict and per-sample rows (for CSV).
+    Batch items from CSVClipDataset:
+      (image, label, text) or (image, label, text, path)
+    Return:
+      images: (B, C, H, W)
+      labels: (B,) long
     """
-    # Precompute lengths (letters only) per class
-    class_len = [letter_len(c) for c in class_names]
-    C = len(class_names)
+    imgs, ys = [], []
+    for item in batch:
+        if len(item) == 3:
+            img, y, _txt = item
+        elif len(item) == 4:
+            img, y, _txt, _path = item
+        else:
+            raise ValueError(f"Unexpected item length {len(item)} (expected 3 or 4)")
+        imgs.append(img)
+        if torch.is_tensor(y):
+            ys.append(int(y.item()))
+        else:
+            ys.append(int(y))
+    return torch.stack(imgs, 0), torch.tensor(ys, dtype=torch.long)
 
-    # Move class embeds once
-    class_embeds = class_embeds.to(device)  # [C, D]
 
-    total = 0
-    correct_top1 = 0
-    correct_top5 = 0
-    correct_len_top1 = 0
-    correct_len_top5 = 0
+def load_checkpoint_into_model(model, ckpt_path: str):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(ckpt, dict):
+        state = ckpt.get("model_state_dict") or ckpt.get("model") or ckpt
+    else:
+        state = ckpt
+    model.load_state_dict(state, strict=True)
+    return model
 
-    per_rows = []  # for CSV
 
-    for batch in dataloader:
-        imgs, labels, paths, y = batch  # labels are str, y is int (not used here)
-        b = imgs.size(0)
-        total += b
+def build_class_text_features(model, tokenizer, class_index_json: str, prompts_json: str, device: str):
+    # class_index: {label_str: int_id}
+    with open(class_index_json, "r") as f:
+        class_index = json.load(f)
+    # prompts: {label_str: [prompt1, prompt2, ...]}
+    with open(prompts_json, "r") as f:
+        all_prompts = json.load(f)
 
-        imgs = imgs.to(device)
+    idx_to_label = {v: k for k, v in class_index.items()}
+    num_classes = len(idx_to_label)
 
-        # Encode images
-        if backend == "open_clip":
-            img_feats = model.encode_image(imgs)
-        else:  # hf
-            # If using HF processor, it expects dicts; but for speed we passed tensors via Dataset transforms.
-            img_feats = model.get_image_features(pixel_values=imgs)
+    class_names = []
+    texts_per_class = []
 
-        img_feats = torch.nn.functional.normalize(img_feats, dim=-1)  # [B, D]
+    for i in range(num_classes):
+        label = idx_to_label[i]
+        class_names.append(label)
+        plist = all_prompts.get(label, [label])
+        prompt = plist[0] if len(plist) > 0 else label
+        texts_per_class.append(prompt)
 
-        # Cosine sim ~ dot product of normalized vectors
-        logits = img_feats @ class_embeds.T  # [B, C]
+    class_lens = [letter_len(c) for c in class_names]
 
-        # Standard Top-k
-        topk = min(5, C)
-        topk_vals, topk_idx = logits.topk(topk, dim=1)  # [B, K]
+    with torch.no_grad():
+        tokenized = tokenizer(texts_per_class).to(device)
+        with torch.amp.autocast('cuda' if device == "cuda" else 'cpu'):
+            text_features = model.encode_text(tokenized)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # Length-constrained Top-k
-        # Build mask per sample: keep classes with matching letter length to GT label
-        gt_lens = [letter_len(l) for l in labels]
-        mask = torch.zeros_like(logits, dtype=torch.bool)  # [B, C]
-        for i, L in enumerate(gt_lens):
-            # mark candidates matching that length
-            # (simple equal-length rule; you can relax to +/-1 if desired)
-            ok = [j for j, cl in enumerate(class_len) if cl == L]
-            if ok:
-                mask[i, torch.tensor(ok, device=mask.device)] = True
-            else:
-                # If no candidates of same length, fall back to all (avoid empty)
-                mask[i, :] = True
+    return text_features, class_names, class_lens, idx_to_label
 
-        masked_logits = logits.masked_fill(~mask, -1e9)  # large negative where disallowed
 
-        len_topk_vals, len_topk_idx = masked_logits.topk(topk, dim=1)  # [B, K]
-
-        # Compute correctness
-        for i in range(b):
-            gt = labels[i]
-            gt_idx = class_names.index(gt) if gt in class_names else None
-
-            # Unconstrained checks
-            preds = [class_names[j] for j in topk_idx[i].tolist()]
-            hit_top1 = (preds[0] == gt)
-            hit_top5 = (gt in preds)
-
-            # Len-constrained checks
-            lpreds = [class_names[j] for j in len_topk_idx[i].tolist()]
-            l_hit_top1 = (lpreds[0] == gt)
-            l_hit_top5 = (gt in lpreds)
-
-            correct_top1 += int(hit_top1)
-            correct_top5 += int(hit_top5)
-            correct_len_top1 += int(l_hit_top1)
-            correct_len_top5 += int(l_hit_top5)
-
-            per_rows.append({
-                "path": paths[i],
-                "label": gt,
-                "pred_top1": preds[0],
-                "preds_top5": "|".join(preds),
-                "len_pred_top1": lpreds[0],
-                "len_preds_top5": "|".join(lpreds),
-                "gt_len": letter_len(gt),
-                "top1_correct": int(hit_top1),
-                "top5_correct": int(hit_top5),
-                "len_top1_correct": int(l_hit_top1),
-                "len_top5_correct": int(l_hit_top5),
-            })
-
-    metrics = {
-        "num_samples": int(total),
-        "top1": correct_top1 / max(1, total),
-        "top5": correct_top5 / max(1, total),
-        "len_top1": correct_len_top1 / max(1, total),
-        "len_top5": correct_len_top5 / max(1, total),
-    }
-    return metrics, per_rows
-
-# -------------------------------
-# Main
-# -------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--splits", required=True)
     ap.add_argument("--class_index", required=True)
     ap.add_argument("--prompts", required=True)
-    ap.add_argument("--split", default="test")
-
-    ap.add_argument("--backend", choices=["open_clip", "hf"], default="open_clip")
-    ap.add_argument("--model", default="ViT-B-32", help="open_clip model name OR HF model name/path")
-    ap.add_argument("--pretrained", default="laion2b_s34b_b79k", help="open_clip pretrained tag (ignored for HF)")
-
-    ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-
-    ap.add_argument("--out_metrics", default="eval_length_metrics.json")
-    ap.add_argument("--out_predictions", default="eval_length_predictions.csv")
+    ap.add_argument("--model", default="ViT-B-32")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--out_metrics", default=None, help="JSON file for length-wise and overall stats")
     args = ap.parse_args()
 
-    device = args.device
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load label space and prompts
-    class_index = load_json(args.class_index)  # {label: idx}
-    # Ensure deterministic order for class list
-    labels_sorted = sorted(class_index.keys(), key=lambda s: class_index[s])
+    # Dataset: test split
+    ds = CSVClipDataset(
+        manifest_csv=args.manifest,
+        splits_csv=args.splits,
+        class_index_json=args.class_index,
+        prompts_json=args.prompts,
+        split="test",
+        img_size=args.img_size,
+    )
 
-    prompts = load_json(args.prompts)  # {label: [prompt1, prompt2, ...]}
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        collate_fn=collate_eval,
+    )
 
-    # Build transforms and model
-    if args.backend == "open_clip":
-        model, tokenizer, preprocess = build_openclip(args.model, args.pretrained, device)
-        model.eval()
-        # Build class text embeddings (avg over prompt variants)
-        class_embeds, class_names = build_class_text_embeds_openclip(
-            model, tokenizer, prompts, labels_sorted, device
-        )
-        # Dataset transform (open_clip preprocess is fine)
-        img_transform = preprocess
-        hf_processor = None
+    # Model + checkpoint
+    model, _, _ = open_clip.create_model_and_transforms(args.model, pretrained=None)
+    model = load_checkpoint_into_model(model, args.ckpt)
+    model = model.to(device)
+    model.eval()
+
+    tokenizer = open_clip.get_tokenizer(args.model)
+
+    # Precompute text features for all classes + class lengths
+    text_features, class_names, class_lens, idx_to_label = build_class_text_features(
+        model, tokenizer, args.class_index, args.prompts, device
+    )
+    class_lens = torch.tensor(class_lens, device=device, dtype=torch.long)
+
+    # Per-length stats
+    per_len = {}  # L -> dict(top1_correct, top5_correct, total)
+
+    with torch.no_grad():
+        for images, ys in tqdm(loader, desc="Eval (length constrained)"):
+            images = images.to(device, non_blocking=True)
+            ys = ys.to(device, non_blocking=True)
+
+            with torch.amp.autocast('cuda' if device == "cuda" else 'cpu'):
+                image_features = model.encode_image(images)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                logit_scale = model.logit_scale.exp()
+                logits = logit_scale * image_features @ text_features.t()  # (B, C)
+
+            B = ys.size(0)
+
+            for i in range(B):
+                y = ys[i].item()
+                # ground-truth class name & length
+                label_name = idx_to_label[y]
+                L = letter_len(label_name)
+
+                if L not in per_len:
+                    per_len[L] = {"top1_correct": 0, "top5_correct": 0, "total": 0}
+
+                per_len[L]["total"] += 1
+
+                # mask classes by matching length
+                # boolean mask over all classes
+                len_mask = (class_lens == L)  # (C,)
+                sample_logits = logits[i]
+                masked_logits = sample_logits.masked_fill(~len_mask, -1e9)
+
+                # if no class has this length (weird edge case), skip
+                if (~torch.isfinite(masked_logits)).all():
+                    continue
+
+                topk_vals, topk_idx = masked_logits.topk(5, dim=0)  # (5,)
+
+                pred1 = topk_idx[0].item()
+                if pred1 == y:
+                    per_len[L]["top1_correct"] += 1
+                if int(y) in topk_idx.tolist():
+                    per_len[L]["top5_correct"] += 1
+
+    # Aggregate & print
+    overall_top1 = 0
+    overall_top5 = 0
+    overall_total = 0
+
+    print("\n=== Length-constrained results ===")
+    for L in sorted(per_len.keys()):
+        d = per_len[L]
+        if d["total"] == 0:
+            continue
+        t1 = d["top1_correct"] / d["total"]
+        t5 = d["top5_correct"] / d["total"]
+        overall_top1 += d["top1_correct"]
+        overall_top5 += d["top5_correct"]
+        overall_total += d["total"]
+        print(f"len={L:2d}  n={d['total']:5d}  top1={t1:.3f}  top5={t5:.3f}")
+
+    if overall_total > 0:
+        o1 = overall_top1 / overall_total
+        o5 = overall_top5 / overall_total
+        print(f"\nOVERALL (length-constrained): top1={o1:.3f}, top5={o5:.3f}")
     else:
-        model, tokenize, preprocess_pil, hfproc = build_hfclip(args.model, device)
-        model.eval()
-        # Build class text embeddings
-        class_embeds, class_names = build_class_text_embeds_hf(
-            model, hfproc, prompts, labels_sorted, device
-        )
-        # For HF path we’ll use a transforms pipeline to return normalized tensors compatible with processor
-        # Match CLIP’s 224 short-side defaults (processor will handle if needed)
-        img_transform = T.Compose([
-            T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
-                        std=(0.26862954, 0.26130258, 0.27577711)),
-        ])
-        hf_processor = hfproc
+        o1 = o5 = 0.0
+        print("\nOVERALL (length-constrained): no samples?")
 
-    # Dataset / Loader
-    ds = ManifestDataset(args.manifest, args.splits, args.split, class_index, img_transform)
-    dl = torch.utils.data.DataLoader(
-        ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=(device.startswith("cuda"))
-    )
-
-    # Eval
-    metrics, rows = eval_loop(
-        model=model,
-        dataloader=dl,
-        device=device,
-        class_names=class_names,
-        class_embeds=class_embeds,
-        backend=args.backend,
-    )
-
-    # Save
-    Path(args.out_predictions).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out_predictions, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-            "path","label","pred_top1","preds_top5","len_pred_top1","len_preds_top5",
-            "gt_len","top1_correct","top5_correct","len_top1_correct","len_top5_correct"
-        ])
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-    with open(args.out_metrics, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    print("=== Metrics ===")
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            print(f"{k}: {v:.4f}")
-        else:
-            print(f"{k}: {v}")
+    if args.out_metrics:
+        out = {
+            "per_length": {
+                str(L): {
+                    "top1": float(per_len[L]["top1_correct"] / per_len[L]["total"])
+                    if per_len[L]["total"] > 0 else 0.0,
+                    "top5": float(per_len[L]["top5_correct"] / per_len[L]["total"])
+                    if per_len[L]["total"] > 0 else 0.0,
+                    "total": int(per_len[L]["total"]),
+                }
+                for L in per_len
+            },
+            "overall": {
+                "top1": float(o1),
+                "top5": float(o5),
+                "total": int(overall_total),
+            },
+            "model": args.model,
+            "ckpt": args.ckpt,
+            "img_size": int(args.img_size),
+        }
+        out_path = Path(args.out_metrics)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote metrics to {out_path}")
+        
 
 if __name__ == "__main__":
     main()
