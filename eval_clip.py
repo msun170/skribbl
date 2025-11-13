@@ -15,27 +15,38 @@ from dataset_csv import CSVClipDataset
 
 def collate_eval(batch):
     """
-    Accept items of shape:
-      (image, text, y)            OR
-      (image, text, y, path)
-    Return: images tensor, labels tensor
+    Accept items shaped like your dataset:
+      (image, label, text) or (image, label, text, path)
+
+    Returns:
+      images: (B, C, H, W)
+      labels: (B,) long
     """
     imgs, ys = [], []
     for item in batch:
         if len(item) == 3:
-            img, _txt, y = item
+            img, y, _txt = item          # (image, label, text)
         elif len(item) == 4:
-            img, _txt, y, _path = item
+            img, y, _txt, _path = item   # (image, label, text, path)
         else:
             raise ValueError(f"Unexpected item length {len(item)} (expected 3 or 4)")
+
         imgs.append(img)
-        ys.append(y)
-    return torch.stack(imgs, 0), torch.tensor(ys, dtype=torch.long)
+
+        # y might be a scalar tensor or int
+        if torch.is_tensor(y):
+            ys.append(int(y.item()))
+        else:
+            ys.append(int(y))
+
+    images = torch.stack(imgs, 0)
+    labels = torch.tensor(ys, dtype=torch.long)
+    return images, labels
 
 
 def load_checkpoint_into_model(model, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    # Try a few common layouts
+    # handle different checkpoint formats
     if isinstance(ckpt, dict):
         state = (
             ckpt.get("model_state_dict")
@@ -56,7 +67,7 @@ def build_class_text_features(model, tokenizer, class_index_json: str, prompts_j
     with open(prompts_json, "r") as f:
         all_prompts = json.load(f)
 
-    # Invert class_index: id -> label
+    # id -> label mapping
     idx_to_label = {v: k for k, v in class_index.items()}
     num_classes = len(idx_to_label)
 
@@ -64,7 +75,6 @@ def build_class_text_features(model, tokenizer, class_index_json: str, prompts_j
     for i in range(num_classes):
         label = idx_to_label[i]
         plist = all_prompts.get(label, [label])
-        # simple choice: use the first prompt
         prompt = plist[0] if len(plist) > 0 else label
         texts_per_class.append(prompt)
 
@@ -88,12 +98,12 @@ def main():
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--img_size", type=int, default=224)
-    ap.add_argument("--out", default=None, help="Optional path to write JSON metrics")
+    ap.add_argument("--out", default=None, help="Optional JSON file to write metrics")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Dataset: use test split
+    # Use the test split for evaluation
     ds = CSVClipDataset(
         manifest_csv=args.manifest,
         splits_csv=args.splits,
@@ -113,7 +123,7 @@ def main():
         collate_fn=collate_eval,
     )
 
-    # Build CLIP model skeleton, then load our checkpoint weights
+    # Build model skeleton, then load our trained weights
     model, _, _ = open_clip.create_model_and_transforms(args.model, pretrained=None)
     model = load_checkpoint_into_model(model, args.ckpt)
     model = model.to(device)
@@ -121,7 +131,7 @@ def main():
 
     tokenizer = open_clip.get_tokenizer(args.model)
 
-    # Precompute text features for each class
+    # Precompute per-class text features
     text_features, idx_to_label = build_class_text_features(
         model, tokenizer, args.class_index, args.prompts, device
     )
@@ -140,17 +150,17 @@ def main():
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
                 logit_scale = model.logit_scale.exp()
-                sims = logit_scale * image_features @ text_features.t()
+                sims = logit_scale * image_features @ text_features.t()  # (B, C)
 
-            # top-k over classes
+            # top-5 classes for each image
             k = sims.topk(5, dim=1).indices  # (B, 5)
             pred1 = k[:, 0]
-            y = ys
 
-            top1 += (pred1 == y).sum().item()
-            # top-5: correct if true label is anywhere in the top-5 indices
-            top5 += sum(int(y0 in row) for y0, row in zip(y, k))
-            tot += y.size(0)
+            # top-1 correct
+            top1 += (pred1 == ys).sum().item()
+            # top-5 correct if label appears anywhere in top-5 preds
+            top5 += sum(int(y0 in row) for y0, row in zip(ys, k))
+            tot += ys.size(0)
 
     top1_acc = top1 / tot
     top5_acc = top5 / tot
