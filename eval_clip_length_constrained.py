@@ -172,7 +172,7 @@ def main():
                 # boolean mask over all classes
                 len_mask = (class_lens == L)  # (C,)
                 sample_logits = logits[i]
-                masked_logits = sample_logits.masked_fill(~len_mask, -1e9)
+                masked_logits = sample_logits.masked_fill(~len_mask, -1e4)
 
                 # if no class has this length (weird edge case), skip
                 if (~torch.isfinite(masked_logits)).all():
