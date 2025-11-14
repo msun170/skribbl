@@ -268,7 +268,7 @@ def eval_zero_shot_skribbl(
 
                     len_mask = (skr_lengths == target_len)  # (N_skr,)
                     masked_logits = logits[i].clone()
-                    masked_logits[~len_mask] = -1e9
+                    masked_logits[~len_mask] = -1e4
                     _, topk_idx_len = masked_logits.topk(topk, dim=0)
 
                     preds_len = topk_idx_len.tolist()
