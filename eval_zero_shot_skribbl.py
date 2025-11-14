@@ -46,6 +46,7 @@ from dataset_csv import CSVClipDataset
 # ----------------------------
 
 def load_skribbl_words(path_txt: str):
+    """Load Skribbl vocabulary (one word per line)."""
     words = []
     with open(path_txt, "r", encoding="utf-8") as f:
         for line in f:
@@ -56,9 +57,12 @@ def load_skribbl_words(path_txt: str):
 
 
 def load_idx_to_label(class_index_json: str):
+    """
+    class_index.json is assumed to be {label: idx}
+    Return idx_to_label: {idx: label}
+    """
     with open(class_index_json, "r", encoding="utf-8") as f:
         class_index = json.load(f)
-    # class_index: {label: idx}
     idx_to_label = {v: k for k, v in class_index.items()}
     return idx_to_label
 
@@ -67,66 +71,38 @@ def load_label_to_skribbl_maps(
     matches_csv: str,
     idx_to_label: dict,
     skr_words: list,
-    sim_thresh: float = 0.6
+    sim_thresh: float = 0.6,
 ):
     """
     Build:
 
       label_to_all_targets:  label -> set(skr_idx)
-      label_to_best_target: label -> single skr_idx with highest similarity
+      label_to_best_target:  label -> single skr_idx with highest similarity
 
-    Using skribbl_semantic_matches.csv.
+    Using skribbl_semantic_matches.csv **with your schema**:
 
-    We try to detect column names robustly:
-      - 'dataset_label' or 'label' or 'target_label' for the dataset class
-      - column starting with 'skr' for Skribbl word
-      - column containing 'sim' for similarity (cosine)
+      - 'best_match_norm'   : dataset class label (e.g. "airplane")
+      - 'skribbl_norm'      : normalized Skribbl word
+      - 'cosine_similarity' : similarity score
 
     Rows with similarity < sim_thresh are ignored.
+    Matching to skr_words is done case-insensitively.
     """
     df = pd.read_csv(matches_csv)
 
-    # Find dataset label column
-    col_label = None
-    for c in df.columns:
-        cl = c.lower()
-        if cl in ("dataset_label", "label", "target_label"):
-            col_label = c
-            break
-    if col_label is None:
+    expected_cols = {"best_match_norm", "skribbl_norm", "cosine_similarity"}
+    if not expected_cols.issubset(df.columns):
         raise ValueError(
-            f"Couldn't find dataset label column in {matches_csv}. "
-            f"Columns: {list(df.columns)}"
+            f"Expected columns {expected_cols} in {matches_csv}, "
+            f"but got: {list(df.columns)}"
         )
 
-    # Find Skribbl word column
-    col_skr = None
-    for c in df.columns:
-        cl = c.lower()
-        if cl.startswith("skr"):
-            col_skr = c
-            break
-    if col_skr is None:
-        raise ValueError(
-            f"Couldn't find Skribbl word column in {matches_csv}. "
-            f"Columns: {list(df.columns)}"
-        )
+    col_label = "best_match_norm"
+    col_skr = "skribbl_norm"
+    col_sim = "cosine_similarity"
 
-    # Find similarity column
-    col_sim = None
-    for c in df.columns:
-        cl = c.lower()
-        if "sim" in cl:
-            col_sim = c
-            break
-    if col_sim is None:
-        raise ValueError(
-            f"Couldn't find similarity column in {matches_csv}. "
-            f"Columns: {list(df.columns)}"
-        )
-
-    # Map Skribbl word -> index
-    skr_word_to_idx = {w: i for i, w in enumerate(skr_words)}
+    # Map Skribbl word (lowercased) -> index
+    skr_word_to_idx = {w.lower(): i for i, w in enumerate(skr_words)}
 
     # Initialize maps
     label_to_all_targets = {lbl: set() for lbl in idx_to_label.values()}
@@ -134,8 +110,8 @@ def load_label_to_skribbl_maps(
     label_to_best_sim = {lbl: -1.0 for lbl in idx_to_label.values()}
 
     for _, row in df.iterrows():
-        lbl = str(row[col_label])
-        skr = str(row[col_skr])
+        lbl = str(row[col_label]).strip()
+        skr = str(row[col_skr]).strip().lower()
         sim = float(row[col_sim])
 
         if sim < sim_thresh:
@@ -143,7 +119,7 @@ def load_label_to_skribbl_maps(
         if skr not in skr_word_to_idx:
             continue
         if lbl not in label_to_all_targets:
-            # likely an ImageNet or pruned label not in your final 330
+            # likely a label that doesn't exist in your final 330 (e.g. Imagenet-only)
             continue
 
         skr_idx = skr_word_to_idx[skr]
@@ -154,7 +130,6 @@ def load_label_to_skribbl_maps(
             label_to_best_sim[lbl] = sim
             label_to_best_target[lbl] = skr_idx
 
-    # Remove labels that ended up with no targets at all
     return label_to_all_targets, label_to_best_target
 
 
@@ -173,9 +148,9 @@ def build_skribbl_text_features(model, tokenizer, skr_words, device):
     with torch.no_grad():
         for i in tqdm(range(0, len(skr_words), batch_size),
                       desc="Encoding Skribbl words"):
-            chunk = skr_words[i : i + batch_size]
+            chunk = skr_words[i: i + batch_size]
             tokens = tokenizer(chunk).to(device)
-            with torch.amp.autocast("cuda" if device == "cuda" else "cpu"):
+            with torch.amp.autocast("cuda" if device.startswith("cuda") else "cpu"):
                 emb = model.encode_text(tokens)
                 emb = emb / emb.norm(dim=-1, keepdim=True)
             feats.append(emb.cpu())
@@ -211,7 +186,7 @@ def load_finetuned_model(model_name, ckpt_path, device):
     model, _, _ = open_clip.create_model_and_transforms(
         model_name,
         pretrained=None,
-        precision="fp16" if device == "cuda" else "fp32",
+        precision="fp16" if device.startswith("cuda") else "fp32",
     )
     model = model.to(device)
 
@@ -263,19 +238,19 @@ def eval_zero_shot_skribbl(
             ys = ys.to(device, non_blocking=True)
 
             # Encode images
-            with torch.amp.autocast("cuda" if device == "cuda" else "cpu"):
+            with torch.amp.autocast("cuda" if device.startswith("cuda") else "cpu"):
                 img_feats = model.encode_image(images)
                 img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
                 logits = img_feats @ skr_text_feats.t()  # (B, N_skr)
 
-            # Precompute unconstrained top-k
+            # Unconstrained top-k indices
             _, topk_idx = logits.topk(topk, dim=1)  # (B, topk)
 
             for i in range(images.size(0)):
                 class_idx = int(ys[i].item())
                 label = idx_to_label[class_idx]
 
-                # ---- Unconstrained (any Skribbl synonym) ----
+                # ---- Unconstrained (any Skribbl synonym for this label) ----
                 tgt_set = label_to_all_targets.get(label, set())
                 if tgt_set:
                     covered_uc += 1
@@ -285,15 +260,13 @@ def eval_zero_shot_skribbl(
                     if any(p in tgt_set for p in preds):
                         topk_uc += 1
 
-                # ---- Length-constrained (canonical Skribbl word) ----
+                # ---- Length-constrained (canonical Skribbl word per label) ----
                 canonical_idx = label_to_best_target.get(label, None)
                 if canonical_idx is not None:
                     covered_len += 1
                     target_len = int(skr_lengths[canonical_idx].item())
 
-                    # mask to length == target_len
                     len_mask = (skr_lengths == target_len)  # (N_skr,)
-                    # large negative for masked-out
                     masked_logits = logits[i].clone()
                     masked_logits[~len_mask] = -1e9
                     _, topk_idx_len = masked_logits.topk(topk, dim=0)
@@ -391,7 +364,11 @@ def main():
     # Skribbl text features
     skr_text_feats = build_skribbl_text_features(model, tokenizer, skr_words, device)
     # Vector of word lengths for length-constraint masking
-    skr_lengths = torch.tensor([len(w) for w in skr_words], device=device, dtype=torch.long)
+    skr_lengths = torch.tensor(
+        [len(w) for w in skr_words],
+        device=device,
+        dtype=torch.long,
+    )
 
     # Run evaluation
     results = eval_zero_shot_skribbl(
@@ -410,13 +387,17 @@ def main():
     cov_len = results["covered_lenconstrained"] / len(ds_test) if len(ds_test) > 0 else 0.0
 
     print("\n=== Zero-shot Skribbl-space results (test split) ===")
-    print(f"Coverage (unconstrained): {results['covered_unconstrained']} / {len(ds_test)} "
-          f"({cov_uc:.3%})")
+    print(
+        f"Coverage (unconstrained): {results['covered_unconstrained']} / {len(ds_test)} "
+        f"({cov_uc:.3%})"
+    )
     print(f"  top1 (unconstrained): {results['top1_unconstrained']:.3f}")
     print(f"  top{args.topk} (unconstrained): {results['topk_unconstrained']:.3f}")
 
-    print(f"\nCoverage (length-constrained): {results['covered_lenconstrained']} / {len(ds_test)} "
-          f"({cov_len:.3%})")
+    print(
+        f"\nCoverage (length-constrained): {results['covered_lenconstrained']} / {len(ds_test)} "
+        f"({cov_len:.3%})"
+    )
     print(f"  top1 (length-constrained): {results['top1_lenconstrained']:.3f}")
     print(f"  top{args.topk} (length-constrained): {results['topk_lenconstrained']:.3f}")
 
