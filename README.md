@@ -65,9 +65,11 @@ cd /workspace/skribbl
 source .venv/bin/activate
 
 pushing to github:
+
 git add filename
 git commit -m "commit message"
 git pull --rebase
 git push
+
 
 
